@@ -3,7 +3,7 @@ extends Node
 const ORIGIN := Vector2(64, 64)
 const PEER_ORIGIN := Vector2(384, 64)
 const COLORS := [Color.RED, Color.GREEN, Color.BLUE, Color.YELLOW]
-const DEADLINE_MS := 90000
+var deadline_ms := 90000
 var browser: Object
 var surface: TextureRect
 var peer_browser: Object
@@ -21,6 +21,11 @@ var start_ms := 0
 var finished := false
 var scenario := "lifecycle"
 var pacing: Dictionary = {}
+var bench: Array[Dictionary] = []
+var bench_frame_start := 0
+var bench_pump: PackedFloat64Array = []
+var bench_frame: PackedFloat64Array = []
+var bench_page: PackedStringArray = []
 
 
 func _ready() -> void:
@@ -42,7 +47,7 @@ func _ready() -> void:
 
 
 func _process(_delta: float) -> void:
-	if not finished and Time.get_ticks_msec() - start_ms > DEADLINE_MS:
+	if not finished and Time.get_ticks_msec() - start_ms > deadline_ms:
 		fail("Graphical test exceeded its internal deadline")
 
 
@@ -98,6 +103,8 @@ func _on_browser_console_message(_level: int, message: String, _source: String, 
 		if dimensions is Dictionary:
 			page_dimensions.append(dimensions)
 		print(message)
+	if message.begins_with("GDCEF_BENCH_PAGE "):
+		bench_page = message.split(" ")
 
 
 func read_sequence(image: Image, target: TextureRect = null) -> int:
@@ -269,6 +276,9 @@ func run() -> void:
 		return
 	if scenario == "pacing":
 		await run_pacing()
+		return
+	if scenario == "bench":
+		await run_bench()
 		return
 	for generation in range(2):
 		create_browser()
@@ -460,6 +470,109 @@ func run_pacing() -> void:
 	finish()
 
 
+func _bench_frame_start() -> void:
+	bench_frame_start = Time.get_ticks_usec()
+
+
+func _bench_pre_draw() -> void:
+	bench_pump.append((Time.get_ticks_usec() - bench_frame_start) / 1000.0)
+
+
+func _bench_post_draw() -> void:
+	bench_frame.append((Time.get_ticks_usec() - bench_frame_start) / 1000.0)
+
+
+func bench_stats(prefix: String, samples: PackedFloat64Array) -> Dictionary:
+	samples.sort()
+	var total := 0.0
+	for value in samples:
+		total += value
+	return {
+		prefix + "_mean": snappedf(total / samples.size(), 0.001),
+		prefix + "_med": samples[int(samples.size() * 0.5)],
+		prefix + "_p99": samples[mini(samples.size() - 1, int(samples.size() * 0.99))],
+	}
+
+
+## Asks the page for [rAF callbacks so far, page clock in ms]. Empty when the
+## browser class has no console_message signal to answer through.
+func bench_page_frames() -> Array[float]:
+	bench_page = PackedStringArray()
+	browser.call("eval", "window.benchReport()")
+	var deadline := Time.get_ticks_msec() + 3000
+	while bench_page.size() < 3 and Time.get_ticks_msec() < deadline:
+		await get_tree().process_frame
+	if bench_page.size() < 3:
+		return []
+	return [float(bench_page[1]), float(bench_page[2])]
+
+
+func run_bench() -> void:
+	deadline_ms = 300000
+	# Signal handlers run in connection order. The addon connects its CEF message
+	# pump to process_frame when the first browser initializes CEF, so the frame
+	# clock must connect first, or the pump's work would precede every sample.
+	# The draw hooks connect after the browser, to run after the addon's own.
+	if not get_tree().process_frame.get_connections().is_empty():
+		fail("The bench frame clock must be the first process_frame connection")
+		return
+	get_tree().process_frame.connect(_bench_frame_start)
+	create_browser()
+	if not await expect_sequence(1, "bench-initial"):
+		return
+	surface.position = Vector2.ZERO
+	# pump_ms: frame start until drawing begins (CEF's pump and frame capture).
+	# frame_ms: frame start until the frame is presented (adds publication,
+	# rendering and presentation); it excludes only the FPS cap's sleep.
+	RenderingServer.frame_pre_draw.connect(_bench_pre_draw)
+	RenderingServer.frame_post_draw.connect(_bench_post_draw)
+	for size_text in OS.get_environment("GDCEF_RENDER_BENCH_SIZES").split(","):
+		# The surface may exceed the window: the browser still renders all of it.
+		if not resize_browser(Vector2i(int(size_text.get_slice("x", 0)), int(size_text.get_slice("x", 1)))):
+			return
+		for animated: bool in [false, true]:
+			browser.call("eval", "window.bench(%s)" % ("true" if animated else "false"))
+			await get_tree().create_timer(2.0).timeout
+			var page_start := await bench_page_frames()
+			print("GDCEF_BENCH_BEGIN")
+			bench_pump.clear()
+			bench_frame.clear()
+			var start_us := Time.get_ticks_usec()
+			var start_draw := Engine.get_frames_drawn()
+			await get_tree().create_timer(8.0).timeout
+			var pump := bench_pump.duplicate()
+			var frame := bench_frame.duplicate()
+			var seconds := (Time.get_ticks_usec() - start_us) / 1000000.0
+			var frames := Engine.get_frames_drawn() - start_draw
+			print("GDCEF_BENCH_END")
+			var page_end := await bench_page_frames()
+			if finished:
+				return
+			if pump.is_empty() or frame.is_empty():
+				fail("%s: no frames were sampled" % size_text)
+				return
+			var row := {
+				"size": size_text, "load": "animated" if animated else "static",
+				"fps": snappedf(frames / seconds, 0.1), "page_fps": null,
+				"samples": frame.size(),
+			}
+			if not page_start.is_empty() and not page_end.is_empty():
+				row.page_fps = snappedf((page_end[0] - page_start[0]) * 1000.0 / (page_end[1] - page_start[1]), 0.1)
+			row.merge(bench_stats("pump_ms", pump))
+			row.merge(bench_stats("frame_ms", frame))
+			bench.append(row)
+		# Readback only after sampling, so it cannot perturb the numbers. The
+		# animated page changes hue every frame: equal pixels mean no frames arrive.
+		var first := (await frame_image()).get_pixel(4, 4)
+		await get_tree().create_timer(0.2).timeout
+		var second := (await frame_image()).get_pixel(4, 4)
+		if first.is_equal_approx(second):
+			fail("%s: animated browser frames did not reach the viewport" % size_text)
+			return
+		checks += 1
+	finish()
+
+
 func fail(message: String) -> void:
 	if finished:
 		return
@@ -479,7 +592,7 @@ func finish() -> void:
 		"checks": checks, "passed": failures.is_empty(), "failures": failures,
 		"samples": samples, "elapsed_ms": Time.get_ticks_msec() - start_ms,
 		"page_dimensions": page_dimensions,
-		"scenario": scenario, "pacing": pacing,
+		"scenario": scenario, "pacing": pacing, "bench": bench,
 	}
 	var file := FileAccess.open(evidence.path_join("result.json"), FileAccess.WRITE)
 	if file != null:
