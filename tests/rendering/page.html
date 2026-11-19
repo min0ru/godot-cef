@@ -105,6 +105,23 @@ window.startPacing = (warmupMs, durationMs) => {
   };
   requestAnimationFrame(tick);
 };
+// Benchmark load: each rAF repaints the whole canvas, so every browser frame
+// carries full damage. bench(false) leaves a static page that produces none.
+let benchOn = false, benchFrames = 0;
+window.bench = animated => {
+  const context = canvas.getContext('2d', { alpha: false });
+  const tick = timestamp => {
+    if (!benchOn) return;
+    benchFrames++;
+    context.fillStyle = `hsl(${timestamp / 5 % 360},100%,50%)`;
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    requestAnimationFrame(tick);
+  };
+  const wasOn = benchOn;
+  benchOn = animated;
+  if (animated && !wasOn) requestAnimationFrame(tick);
+};
+window.benchReport = () => console.log(`GDCEF_BENCH_PAGE ${benchFrames} ${performance.now()}`);
 addEventListener('resize', () => window.paint(current));
 window.paint(current);
 </script></body></html>

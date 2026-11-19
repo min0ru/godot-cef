@@ -17,6 +17,7 @@ const { values } = parseArgs({ options: {
   "thread-model": { type: "string", default: "0,2" },
   "gpu-validation": { type: "boolean", default: false },
   scenario: { type: "string", default: "lifecycle" },
+  "bench-sizes": { type: "string", default: "1280x720,1920x1080,3840x2160" },
 } });
 if (!values.godot) throw new Error("Pass --godot <Godot executable>; use *_console.exe on Windows");
 const godot = resolve(values.godot);
@@ -25,9 +26,11 @@ const classes = select(values.class, ["CefTexture", "CefTexture2D"], "class");
 const modes = select(values.mode, ["software", "accelerated"], "mode");
 const models = select(values["thread-model"], ["0", "2"], "thread-model");
 const gpuValidationRequested = values["gpu-validation"];
-if (!["lifecycle", "pacing", "popup", "hidden"].includes(values.scenario)) throw new Error("--scenario must be lifecycle, pacing, popup, or hidden");
+if (!["lifecycle", "pacing", "popup", "hidden", "bench"].includes(values.scenario)) throw new Error("--scenario must be lifecycle, pacing, popup, hidden, or bench");
 const pacing = values.scenario === "pacing";
 const popup = values.scenario === "popup";
+const bench = values.scenario === "bench";
+if (bench && !/^\d+x\d+(,\d+x\d+)*$/.test(values["bench-sizes"])) throw new Error("--bench-sizes must be WxH[,WxH...]");
 if (!["d3d12", "vulkan", "metal"].includes(values.driver)) throw new Error("Unknown --driver");
 const runRoot = join(resolve(values.output ?? join(root, "target/rendering")), `${Date.now()}-${process.pid}`);
 const project = join(runRoot, "project");
@@ -120,10 +123,10 @@ try {
       "--position", "-10000,-10000", "--resolution", pacing ? "1280x800" : "640x360",
     ], {
       GDCEF_RENDER_CLASS: className, GDCEF_RENDER_MODE: mode, GDCEF_RENDER_OUTPUT: output,
-      GDCEF_RENDER_SCENARIO: values.scenario,
+      GDCEF_RENDER_SCENARIO: values.scenario, GDCEF_RENDER_BENCH_SIZES: values["bench-sizes"],
       GDCEF_RENDER_URL: popup ? `${fixtureOrigin.replace("127.0.0.1", "localhost")}/redirect?run=${encodeURIComponent(name)}`
         : pacing ? `${fixtureOrigin}/page.html?run=${encodeURIComponent(name)}` : "res://fixture/page.html",
-    }, 105000);
+    }, bench ? 320000 : 105000);
     const reports = processResult.log.split(/\r?\n/)
       .filter(line => line.startsWith("GDCEF_RENDER_RESULT "));
     let report: Record<string, unknown> | null = null;
@@ -141,10 +144,12 @@ try {
     if (mode === "software" && !processResult.log.includes(`[${className}] Creating browser in software rendering mode`)) reasons.push("Software OSR startup was not confirmed");
     const pacingReports = browserPacing.get(name) ?? [];
     const pacingAssessment = pacing ? assessPacing(report, pacingReports, reasons) : null;
-    const result = { name, scenario: values.scenario, passed: reasons.length === 0, reasons, acceleratedObserved, gpuValidationRequested, pacing: pacingAssessment, ...processResult, log: undefined, report };
+    const benchRows = bench ? benchTable(report, processResult.log, reasons) : null;
+    const result = { name, scenario: values.scenario, passed: reasons.length === 0, reasons, acceleratedObserved, gpuValidationRequested, pacing: pacingAssessment, bench: benchRows, ...processResult, log: undefined, report };
     await writeFile(join(output, "assessment.json"), JSON.stringify(result, null, 2));
     results.push(result);
     console.log(`${result.passed ? "PASS" : "FAIL"} ${name}${reasons.length ? ": " + reasons.join("; ") : ""}`);
+    if (benchRows) console.table(benchRows);
   }
 } catch (error) {
   fatal = String(error);
@@ -222,4 +227,15 @@ async function invoke(name: string, args: string[], env: Record<string, string>,
       } catch (error) { reject(error); }
     });
   });
+}
+
+// One row per surface size and load. `imports` counts the Linux addon's DMA-BUF
+// probe log line, printed once per import attempt, between the fixture's phase
+// markers; other platforms report 0.
+function benchTable(report: Record<string, unknown> | null, log: string, reasons: string[]) {
+  const phases = log.split("GDCEF_BENCH_BEGIN").slice(1).map(phase => phase.split("GDCEF_BENCH_END")[0]);
+  const rows = Array.isArray(report?.bench) ? report.bench as Record<string, unknown>[] : [];
+  if (phases.length !== rows.length) reasons.push("Bench phase markers do not match the reported rows");
+  return rows.map((row, index) => ({ ...row,
+    imports: (phases[index]?.match(/DMA-BUF image format probe OK/g) ?? []).length }));
 }

@@ -61,6 +61,52 @@ shutdown. Missing or duplicate reports, low rates, native errors, and leaked RID
 warnings fail the run. `assessment.json` and `summary.json` retain both sets of
 timings, the refresh baseline, thresholds, and computed ratio.
 
+To measure what a continuously repainting browser costs Godot's main thread, run:
+
+```sh
+node tests/rendering/run.ts --godot "$godot" --mode accelerated --class CefTexture --thread-model 0 --scenario bench
+```
+
+`--scenario bench` resizes one browser to each `--bench-sizes` entry (default
+`1280x720,1920x1080,3840x2160`) and samples eight seconds of a static page, then
+eight seconds of a page that repaints its whole canvas on every rAF. Godot is
+capped at 60 FPS with VSync off. The window stays 640×360: the surface may be
+larger than the window, because the browser still renders and hands over all of
+it, and a small window keeps presentation cost out of the numbers. Each row
+reports:
+
+- `pump_ms`: main-thread time from the scene tree's process step
+  (`process_frame`) until drawing begins (`frame_pre_draw`). This holds CEF's
+  message pump and, in it, the capture of an accelerated frame.
+- `frame_ms`: main-thread time from the same start until the frame is
+  presented (`frame_post_draw`). This adds publication, rendering and
+  presentation; only the FPS cap's sleep is excluded.
+- `page_fps`: the page's own rAF rate (`CefTexture` only; null for
+  `CefTexture2D`, which has no console signal), and `fps`: Godot's draw rate.
+- `imports`: how often the Linux importer logged its DMA-BUF format probe,
+  once per new import, during the sample (0 on other platforms).
+
+The static rows are the baseline: the difference to the animated rows is the
+cost of handing frames over. Pixels are read back only between samples, to
+confirm that animated frames reached the viewport. The scenario fails on a
+missing sample or frozen pixels; it has no timing thresholds.
+
+### Comparing two builds
+
+`bench.ts` runs the bench scenario for two complete addons in alternation
+(`CefTexture`, thread model 0) and prints the medians over all rounds as a
+Markdown table:
+
+```sh
+node tests/rendering/bench.ts --godot "$godot" --baseline <addon> --candidate <addon> --rounds 3
+```
+
+`bench.json` in the output directory (`--output`, default
+`target/rendering-bench/<time>`) keeps every round's rows. Each round stages and
+imports a fresh project per build. On Linux without a free desktop, wrap the
+command in `xvfb-run -a`. Run it on an otherwise idle machine and compare the
+spread between rounds before trusting a difference.
+
 To check native popup input and GPU composition after navigation, run:
 
 ```powershell
